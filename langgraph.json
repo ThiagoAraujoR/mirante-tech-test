@@ -1,0 +1,11 @@
+{
+  "python_version": "3.12",
+  "dependencies": ["."],
+  "graphs": {
+    "modernizer": "./src/modernizer/graph.py:graph"
+  },
+  "env": ".env",
+  "http": {
+    "app": "./src/modernizer/api/app.py:app"
+  }
+}

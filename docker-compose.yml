@@ -1,0 +1,220 @@
+name: mirante
+
+services:
+  postgres-app:
+    image: postgres:16-alpine
+    container_name: mirante-postgres-app
+    environment:
+      POSTGRES_USER: ${APP_POSTGRES_USER:-mirante}
+      POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD:-mirante}
+      POSTGRES_DB: ${APP_POSTGRES_DB:-mirante}
+    volumes:
+      - app_pgdata:/var/lib/postgresql/data
+      - ./sql/001_modernization_history.sql:/docker-entrypoint-initdb.d/001_modernization_history.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${APP_POSTGRES_USER:-mirante} -d ${APP_POSTGRES_DB:-mirante}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [mirante-net]
+
+  postgres-sandbox:
+    image: postgres:16-alpine
+    container_name: mirante-postgres-sandbox
+    environment:
+      POSTGRES_USER: ${SANDBOX_POSTGRES_USER:-sandbox}
+      POSTGRES_PASSWORD: ${SANDBOX_POSTGRES_PASSWORD:-sandbox}
+      POSTGRES_DB: ${SANDBOX_POSTGRES_DB:-sandbox}
+    volumes:
+      - sandbox_pgdata:/var/lib/postgresql/data
+      - ./sql/legacy_schema.sql:/docker-entrypoint-initdb.d/001_legacy_schema.sql:ro
+      - ./sql/legacy_seed.sql:/docker-entrypoint-initdb.d/002_legacy_seed.sql:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SANDBOX_POSTGRES_USER:-sandbox} -d ${SANDBOX_POSTGRES_DB:-sandbox}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [mirante-net]
+
+  modernizer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mirante-modernizer-api
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5-20250929}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-8192}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      DATABASE_URL: postgresql+asyncpg://${APP_POSTGRES_USER:-mirante}:${APP_POSTGRES_PASSWORD:-mirante}@postgres-app:5432/${APP_POSTGRES_DB:-mirante}
+      SANDBOX_DATABASE_URL: postgresql+psycopg://${SANDBOX_POSTGRES_USER:-sandbox}:${SANDBOX_POSTGRES_PASSWORD:-sandbox}@postgres-sandbox:5432/${SANDBOX_POSTGRES_DB:-sandbox}
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3000}
+      MAX_GENERATE_ATTEMPTS: ${MAX_GENERATE_ATTEMPTS:-2}
+      ENABLE_DYNAMIC_VALIDATION: ${ENABLE_DYNAMIC_VALIDATION:-true}
+    ports:
+      - "2024:2024"
+    depends_on:
+      postgres-app:
+        condition: service_healthy
+      postgres-sandbox:
+        condition: service_healthy
+    networks: [mirante-net]
+
+  # ----------------- Langfuse (profile: observability) -----------------
+  langfuse-postgres:
+    image: postgres:16-alpine
+    container_name: mirante-langfuse-postgres
+    profiles: ["observability"]
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [mirante-net]
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: mirante-langfuse-clickhouse
+    profiles: ["observability"]
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse_chdata:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [mirante-net]
+
+  langfuse-redis:
+    image: redis:7-alpine
+    container_name: mirante-langfuse-redis
+    profiles: ["observability"]
+    command: ["redis-server", "--requirepass", "langfuse"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "langfuse", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [mirante-net]
+
+  langfuse-minio:
+    image: minio/minio
+    container_name: mirante-langfuse-minio
+    profiles: ["observability"]
+    command: server /data --address ":9000" --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniominio
+    volumes:
+      - langfuse_minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [mirante-net]
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: mirante-langfuse-worker
+    profiles: ["observability"]
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      SALT: mirante-langfuse-salt-change-me
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: redis://default:langfuse@langfuse-redis:6379
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniominio
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+    networks: [mirante-net]
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    container_name: mirante-langfuse-web
+    profiles: ["observability"]
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: mirante-nextauth-secret-change-me
+      SALT: mirante-langfuse-salt-change-me
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: redis://default:langfuse@langfuse-redis:6379
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniominio
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+    networks: [mirante-net]
+
+volumes:
+  app_pgdata:
+  sandbox_pgdata:
+  langfuse_pgdata:
+  langfuse_chdata:
+  langfuse_minio:
+
+networks:
+  mirante-net:
+    driver: bridge
