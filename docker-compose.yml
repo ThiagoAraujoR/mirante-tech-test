@@ -61,6 +61,12 @@ services:
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3000}
       MAX_GENERATE_ATTEMPTS: ${MAX_GENERATE_ATTEMPTS:-2}
       ENABLE_DYNAMIC_VALIDATION: ${ENABLE_DYNAMIC_VALIDATION:-true}
+      RESULTS_DIR: ${RESULTS_DIR:-/results}
+      WRITE_RESULTS_TO_DISK: ${WRITE_RESULTS_TO_DISK:-true}
+    volumes:
+      # Montado FORA de /app para não disparar o watcher do langgraph dev
+      # (hot-reload reiniciaria o servidor a cada arquivo escrito pelo nó persist).
+      - ./results:/results
     ports:
       - "2024:2024"
     depends_on:
@@ -154,7 +160,7 @@ services:
     environment:
       DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
       SALT: mirante-langfuse-salt-change-me
-      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY:?gere com openssl rand -hex 32 e exporte LANGFUSE_ENCRYPTION_KEY no .env}"
       CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
       CLICKHOUSE_USER: clickhouse
@@ -190,7 +196,7 @@ services:
       NEXTAUTH_URL: http://localhost:3000
       NEXTAUTH_SECRET: mirante-nextauth-secret-change-me
       SALT: mirante-langfuse-salt-change-me
-      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY:?gere com openssl rand -hex 32 e exporte LANGFUSE_ENCRYPTION_KEY no .env}"
       CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
       CLICKHOUSE_USER: clickhouse

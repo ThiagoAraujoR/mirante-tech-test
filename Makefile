@@ -1,4 +1,4 @@
-.PHONY: help up up-core down logs build test lint typecheck eval run-annexes shell-db shell-sandbox clean
+.PHONY: help up up-core down logs build test lint typecheck eval run-annexes shell-db shell-sandbox clean validate-e2e
 
 help:
 	@echo "Targets disponíveis:"
@@ -14,6 +14,7 @@ help:
 	@echo "  run-annexes   - executa pipeline em cada Anexo e persiste em results/"
 	@echo "  shell-db      - abre psql no postgres-app"
 	@echo "  shell-sandbox - abre psql no postgres-sandbox"
+	@echo "  validate-e2e  - validação ponta-a-ponta (up + health + qa + smoke + annexes + eval)"
 	@echo "  clean         - remove caches"
 
 up:
@@ -55,3 +56,6 @@ shell-sandbox:
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov coverage.xml .coverage
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+validate-e2e:
+	bash scripts/validate_e2e.sh

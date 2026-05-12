@@ -17,7 +17,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN pip install --upgrade pip wheel \
-    && pip wheel --wheel-dir=/wheels .
+    && pip wheel --wheel-dir=/wheels '.[dev]'
 
 # ---------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
@@ -41,6 +41,7 @@ COPY sql ./sql
 COPY eval ./eval
 COPY examples ./examples
 COPY scripts ./scripts
+COPY tests ./tests
 
 EXPOSE 2024
 

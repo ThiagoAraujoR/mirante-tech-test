@@ -1,5 +1,11 @@
 # Mirante — Pipeline Híbrido de Modernização PL/pgSQL → Python 3.14
 
+> ⚠️ **Aviso: este projeto é uma Prova de Conceito (POC).**
+>
+> O objetivo é demonstrar a viabilidade técnica do pipeline híbrido (LLM + Rules) de modernização e validar a arquitetura proposta — **não é um produto pronto para produção**. Limitações conhecidas e evolução futura estão documentadas na seção [Limitações e Evolução](#limitações-e-evolução).
+>
+> **Sobre chaves de API de LLM:** o repositório **não** inclui chaves de API. Para executar o pipeline é necessário que o usuário forneça **suas próprias chaves** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` ou `GOOGLE_API_KEY`) no arquivo `.env`. Os modelos padrão escolhidos (ex.: `claude-opus-4-7`, `gpt-4o`, `gemini-2.5-pro`) são suficientes para a maioria dos casos de uso da POC. Caso seja necessário utilizar uma **ferramenta/LLM mais poderosa** (modelos de raciocínio estendido, modelos especializados em código, modelos pagos de tier superior, etc.) para cenários mais exigentes — anexos com lógica complexa, procedures muito extensas ou requisitos de maior fidelidade semântica — o usuário deve providenciar e adicionar **suas próprias chaves de API** do provedor escolhido. Custos de inferência são de responsabilidade do usuário.
+
 Pipeline híbrida (LLM + Rules) orquestrada com **LangGraph** que recebe uma stored procedure PL/pgSQL e produz um módulo Python 3.14 equivalente, junto com um relatório estruturado das etapas executadas. Exposta como servidor `langgraph cli` com endpoints `POST /modernize` e `GET /health`, persistência em PostgreSQL, observabilidade em Langfuse e métrica de evaluation própria.
 
 ---
@@ -74,7 +80,7 @@ flowchart TD
 ### Pré-requisitos
 
 - Docker 24+ e Docker Compose v2
-- Chave de API de pelo menos um provedor LLM (Anthropic ou OpenAI)
+- **Chave de API própria** de pelo menos um provedor LLM (Anthropic, OpenAI ou Google Gemini). O projeto **não** distribui chaves — cada usuário deve usar a sua. Se um modelo mais poderoso for necessário para o seu caso de uso, use a chave do tier correspondente do provedor escolhido.
 
 ### Passo a passo
 
@@ -109,6 +115,21 @@ make shell-db
 mirante=# SELECT id, status, llm_provider, latency_ms FROM modernization_history ORDER BY created_at DESC LIMIT 10;
 ```
 
+### Validação ponta-a-ponta
+
+Para rodar **todos os comandos do projeto numa única passada** (inicialização, health, QA, smoke do `/modernize`, bateria de anexos, evaluation e inspeção de persistência), use:
+
+```bash
+make validate-e2e   # ou: bash scripts/validate_e2e.sh
+```
+
+O script:
+- **Não derruba a stack** ao final (use `make down` quando quiser parar).
+- Continua mesmo se uma etapa falhar — cada step independente é marcado como `OK`, `FAIL` ou `SKIP` (etapas que dependem de LLM são puladas se a chave de API parecer placeholder).
+- Grava log detalhado por etapa em `.e2e-logs/<timestamp>_<step>.log` e um sumário em `.e2e-logs/summary_<timestamp>.txt`.
+- Auto-conserta pré-requisitos comuns: copia `.env.example` → `.env` se faltar, gera `LANGFUSE_ENCRYPTION_KEY` se ausente/inválida.
+- Exit code: `0` se todas passaram, `1` se houve falha.
+
 ### Variáveis de ambiente principais
 
 | Var | Default | Descrição |
@@ -120,8 +141,11 @@ mirante=# SELECT id, status, llm_provider, latency_ms FROM modernization_history
 | `DATABASE_URL` | postgres-app:5432/mirante | conexão async (asyncpg) |
 | `SANDBOX_DATABASE_URL` | postgres-sandbox:5432/sandbox | conexão sync (psycopg) |
 | `LANGFUSE_ENABLED` | `false` | liga callback do Langfuse |
+| `LANGFUSE_ENCRYPTION_KEY` | _(obrigatória se `--profile observability`)_ | hex de 64 chars; gere com `openssl rand -hex 32`. Sem ela, `langfuse-web` e `langfuse-worker` não sobem. |
 | `MAX_GENERATE_ATTEMPTS` | `2` | retries do generate em erros estáticos |
 | `ENABLE_DYNAMIC_VALIDATION` | `true` | valida em sandbox real |
+| `RESULTS_DIR` | `/app/results` (container) / `results` (local) | onde o pipeline materializa `generated.py`, `report.json` e `decisions.md` a cada run |
+| `WRITE_RESULTS_TO_DISK` | `true` | liga/desliga a escrita em disco do nó persist |
 
 ---
 
@@ -186,7 +210,15 @@ Em duas camadas:
 
 ### Nó 5 — Persistência (`src/modernizer/nodes/persist.py`)
 
-**Sempre** é executado, independentemente do desfecho. Grava em `modernization_history` (UUID, source/generated, report JSONB, status, provider, model, latency, cost, error). É best-effort: se o DB cair, registra log mas não derruba a resposta.
+**Sempre** é executado, independentemente do desfecho. Grava em dois lugares:
+
+1. **PostgreSQL** (`modernization_history`): UUID, source/generated, report JSONB, status, provider, model, latency, cost, error. É best-effort: se o DB cair, registra log mas não derruba a resposta.
+2. **Disco** (`$RESULTS_DIR`, default `results/`): para cada run, cria um subdiretório `<timestamp>_<object_name>_<short_run_id>/` contendo:
+   - `generated.py` — código Python gerado
+   - `report.json` — payload completo (status, generated_code, report, error_message)
+   - `decisions.md` — decisões e caveats do LLM em Markdown
+
+O caminho do diretório materializado também é incluído na resposta dentro de `report.artifacts.results_dir`. A escrita em disco pode ser desligada via `WRITE_RESULTS_TO_DISK=false`. No `docker-compose.yml`, o caminho `/app/results` do container é montado em `./results` do host, então os arquivos ficam disponíveis fora do container.
 
 ---
 
@@ -274,19 +306,41 @@ Scores são gravados em `evaluation_results` e (opcionalmente) no Langfuse via `
 
 ## Observabilidade (bônus 1)
 
-Langfuse self-hosted exposto em `http://localhost:3000`. Cada execução da pipeline gera um **trace** com spans por nó do grafo. Chamadas LLM trazem automaticamente:
+Langfuse self-hosted exposto em `http://localhost:3000`. A stack completa (web + worker + postgres + clickhouse + redis + minio) está **definida no próprio [docker-compose.yml](docker-compose.yml)** sob o profile `observability` — não é um serviço externo. `make up` sobe tudo; `make up-core` sobe apenas o pipeline (sem Langfuse).
+
+Cada execução da pipeline gera um **trace** com spans por nó do grafo. Chamadas LLM trazem automaticamente:
 
 - tokens (input/output, incluindo cache hits)
 - latência por chamada
 - custo estimado (do nosso `pricing.py`)
 - prompts e respostas completas
 
-Para habilitar, no `.env`:
+### Pré-requisito obrigatório: `LANGFUSE_ENCRYPTION_KEY`
+
+O Langfuse 3 **exige** uma chave hex de 256 bits (64 caracteres) válida para criptografar dados sensíveis no banco. O worker e o web falham na inicialização (`ZodError: ENCRYPTION_KEY must be 256 bits`) se a chave for ausente, curta ou inválida.
+
+Gere e adicione ao `.env` **antes** de subir a stack:
+
+```bash
+echo "LANGFUSE_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> .env
 ```
-LANGFUSE_ENABLED=true
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_SECRET_KEY=sk-lf-...
-```
+
+O `docker-compose.yml` referencia essa variável com `required-check` (`${LANGFUSE_ENCRYPTION_KEY:?...}`) — se ela não estiver no `.env`, `make up` aborta com mensagem explicando como gerar.
+
+### Habilitando o callback do pipeline
+
+1. Subir a stack: `make up` (vai falhar no Langfuse sem a chave acima).
+2. Acessar `http://localhost:3000`, criar uma conta e um projeto.
+3. Copiar a public/secret key do projeto para o `.env`:
+   ```
+   LANGFUSE_ENABLED=true
+   LANGFUSE_PUBLIC_KEY=pk-lf-...
+   LANGFUSE_SECRET_KEY=sk-lf-...
+   ```
+4. Reiniciar o modernizer-api para recarregar o `.env`:
+   ```bash
+   docker compose restart modernizer-api
+   ```
 
 Na primeira execução, acesse `http://localhost:3000`, crie um projeto, copie as chaves para o `.env` e reinicie a `modernizer-api`. As chaves são lidas pelo `langfuse_setup.py` no boot.
 
@@ -303,7 +357,9 @@ Na primeira execução, acesse `http://localhost:3000`, crie um projeto, copie a
 
 ---
 
-## Limitações conhecidas
+## Limitações e Evolução
+
+### Limitações conhecidas
 
 1. **Cobertura sintática parcial.** Casos não cobertos pelo parser (dialetos exóticos, PL/pgSQL com `DO $$ ... $$` anônimo, sintaxe muito antiga) caem no fallback `sqlparse` que produz AST degradada.
 2. **Sandbox de schema fixo.** O Anexo A é o único schema instalado. Procedures que referenciam tabelas fora dele exigem que o caller envie `schema` no payload — atualmente esse schema vai só para o prompt do LLM, não é aplicado ao sandbox.
@@ -311,8 +367,9 @@ Na primeira execução, acesse `http://localhost:3000`, crie um projeto, copie a
 4. **Custo de LLM.** Cada modernização do Anexo F (CTE recursiva) consome ~6k tokens de input + ~3k de output. Com prompt caching, retries custam ~30% disso.
 5. **Concorrência.** O sandbox é um único banco. Múltiplas chamadas paralelas com modernização de procedures distintas podem colidir no `CREATE OR REPLACE`. Mitigação atual: a API serializa execuções dentro do langgraph runtime. Em produção real, usar schemas separados por run (`CREATE SCHEMA run_<uuid>`).
 6. **Python 3.12 no runtime.** O desafio pede que o **código gerado** seja Python 3.14. O runtime do pipeline é 3.12 pela maior estabilidade do ecossistema (langgraph, anthropic SDK). O prompt instrui o LLM a usar sintaxe 3.14 idiomática (PEP 695, etc.).
+7. **Testes não extensivos por custos de API.** O código e a arquitetura foram validados com execuções limitadas dos 5 anexos (Bônus 3 — Evaluation). Testes de carga, stress de concorrência e bateria exaustiva de casos de uso não foram executados para evitar consumo extensivo de tokens de LLM. **A POC assume a responsabilidade de custo para testes mais abrangentes fica por conta de quem use o pipeline em produção ou em ambientes de teste contínuo.**
 
-## O que faria com mais tempo
+### Evolução e melhorias futuras
 
 - **Cache de respostas LLM por (hash(source), hash(prompt_template))** — economizaria 100% em modernizações idênticas (típico em CI).
 - **Fila Redis + workers para batch jobs** — atualmente a API é síncrona; um lote de 1000 procedures travaria. Com Celery/RQ, cada `POST /modernize` retornaria um `job_id` para polling.
